@@ -1,0 +1,435 @@
+项目 'goblin-2api' 的结构树:
+📂 goblin-2api/
+    📄 .env
+    📄 .env.example
+    📄 Dockerfile
+    📄 docker-compose.yml
+    📄 main.py
+    📄 nginx.conf
+    📄 requirements.txt
+    📂 app/
+        📂 core/
+            📄 __init__.py
+            📄 config.py
+        📂 providers/
+            📄 __init__.py
+            📄 base_provider.py
+            📄 goblin_provider.py
+        📂 utils/
+            📄 sse_utils.py
+================================================================================
+
+--- 文件路径: .env ---
+
+# [自动填充] goblin-2api 生产环境配置
+# 该文件由 Project Chimera 自动生成。
+
+# --- 安全配置 ---
+API_MASTER_KEY=1
+
+# --- 端口配置 ---
+NGINX_PORT=8088
+
+
+--- 文件路径: .env.example ---
+
+# /.env.example
+# ====================================================================
+# goblin-2api 配置文件模板
+# ====================================================================
+#
+# 请将此文件重命名为 ".env" 并按需修改。
+#
+
+# --- 核心安全配置 (必须设置) ---
+# 用于保护您 API 服务的访问密钥。
+API_MASTER_KEY=sk-goblin-2api-default-key-please-change-me
+
+# --- 部署配置 (可选) ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8088
+
+
+--- 文件路径: Dockerfile ---
+
+# /Dockerfile
+# ====================================================================
+# Dockerfile for goblin-2api (v1.0 - Chimera Edition)
+# ====================================================================
+
+FROM python:3.10-slim
+
+# 设置环境变量
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+
+# 安装系统依赖 (cloudscraper 可能需要)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# 安装 Python 依赖
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# 复制应用代码
+COPY . .
+
+# 创建并切换到非 root 用户
+RUN useradd --create-home appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
+# 暴露端口并启动
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+
+
+--- 文件路径: docker-compose.yml ---
+
+# /docker-compose.yml
+services:
+  nginx:
+    image: nginx:latest
+    container_name: goblin-2api-nginx
+    restart: always
+    ports:
+      - "${NGINX_PORT:-8088}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+    networks:
+      - goblin-net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: goblin-2api-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - goblin-net
+
+networks:
+  goblin-net:
+    driver: bridge
+
+
+--- 文件路径: main.py ---
+
+# /main.py
+import logging
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException, Depends, Header
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from app.core.config import settings
+from app.providers.goblin_provider import GoblinProvider
+
+# --- 日志配置 ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- 全局 Provider 实例 ---
+provider = GoblinProvider()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info(f"应用启动中... {settings.APP_NAME} v{settings.APP_VERSION}")
+    logger.info("服务已进入 'Cloudscraper & Pseudo-Stream' 模式。")
+    logger.info(f"服务将在 http://localhost:{settings.NGINX_PORT} 上可用")
+    yield
+    logger.info("应用关闭。")
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    description=settings.DESCRIPTION,
+    lifespan=lifespan
+)
+
+# --- 安全依赖 ---
+async def verify_api_key(authorization: Optional[str] = Header(None)):
+    if settings.API_MASTER_KEY and settings.API_MASTER_KEY != "1":
+        if not authorization or "bearer" not in authorization.lower():
+            raise HTTPException(status_code=401, detail="需要 Bearer Token 认证。")
+        token = authorization.split(" ")[-1]
+        if token != settings.API_MASTER_KEY:
+            raise HTTPException(status_code=403, detail="无效的 API Key。")
+
+# --- API 路由 ---
+@app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
+async def chat_completions(request: Request):
+    try:
+        request_data = await request.json()
+        return await provider.chat_completion(request_data)
+    except Exception as e:
+        logger.error(f"处理聊天请求时发生顶层错误: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
+
+@app.get("/v1/models", dependencies=[Depends(verify_api_key)], response_class=JSONResponse)
+async def list_models():
+    return await provider.get_models()
+
+@app.get("/", summary="根路径", include_in_schema=False)
+def root():
+    return {"message": f"欢迎来到 {settings.APP_NAME} v{settings.APP_VERSION}. 服务运行正常。"}
+
+
+--- 文件路径: nginx.conf ---
+
+# /nginx.conf
+worker_processes auto;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream goblin_backend {
+        # ip_hash 确保来自同一客户端的请求被转发到同一个 worker
+        ip_hash;
+        server app:8000;
+    }
+
+    server {
+        listen 80;
+        server_name localhost;
+
+        location / {
+            proxy_pass http://goblin_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            # 流式传输优化
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_set_header Connection '';
+            proxy_http_version 1.1;
+            chunked_transfer_encoding off;
+        }
+    }
+}
+
+
+--- 文件路径: requirements.txt ---
+
+# /requirements.txt
+fastapi
+uvicorn[standard]
+pydantic-settings
+python-dotenv
+cloudscraper
+
+
+--- 文件路径: app\core\__init__.py ---
+
+
+
+--- 文件路径: app\core\config.py ---
+
+# /app/core/config.py
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Optional, Dict, List
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding='utf-8',
+        extra="ignore"
+    )
+
+    APP_NAME: str = "goblin-2api"
+    APP_VERSION: str = "1.0.0"
+    DESCRIPTION: str = "一个将 goblin.tools 转换为兼容 OpenAI 格式 API 的高性能代理。"
+
+    API_MASTER_KEY: Optional[str] = "1"
+    NGINX_PORT: int = 8088
+
+    # 上游请求配置
+    API_REQUEST_TIMEOUT: int = 120
+
+    # 模型名称到上游 URL 的映射
+    MODEL_MAPPING: Dict[str, str] = {
+        "语气评判": "https://goblin.tools/api/ToneJudger/JudgeTone",
+        "回应建议": "https://goblin.tools/api/ToneJudger/SuggestResponse",
+    }
+    DEFAULT_MODEL: str = "语气评判"
+
+    @property
+    def KNOWN_MODELS(self) -> List[str]:
+        return list(self.MODEL_MAPPING.keys())
+
+settings = Settings()
+
+
+--- 文件路径: app\providers\__init__.py ---
+
+
+
+--- 文件路径: app\providers\base_provider.py ---
+
+# /app/providers/base_provider.py
+from abc import ABC, abstractmethod
+from typing import Dict, Any
+from fastapi.responses import StreamingResponse, JSONResponse
+
+class BaseProvider(ABC):
+    @abstractmethod
+    async def chat_completion(self, request_data: Dict[str, Any]) -> StreamingResponse:
+        pass
+
+    @abstractmethod
+    async def get_models(self) -> JSONResponse:
+        pass
+
+
+--- 文件路径: app\providers\goblin_provider.py ---
+
+# /app/providers/goblin_provider.py
+import time
+import json
+import uuid
+import asyncio
+import logging
+from typing import Dict, Any, AsyncGenerator
+
+import cloudscraper
+from fastapi import HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
+
+from app.core.config import settings
+from app.providers.base_provider import BaseProvider
+from app.utils.sse_utils import create_sse_data, create_chat_completion_chunk, DONE_CHUNK
+
+logger = logging.getLogger(__name__)
+
+class GoblinProvider(BaseProvider):
+    def __init__(self):
+        self.scraper = cloudscraper.create_scraper()
+
+    def _prepare_headers(self) -> Dict[str, str]:
+        return {
+            "Accept": "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Content-Type": "application/json",
+            "Origin": "https://goblin.tools",
+            "Referer": "https://goblin.tools/Judge",
+            "Cookie": "gt_lang=zh-CN",
+        }
+
+    def _prepare_payload(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
+        messages = request_data.get("messages", [])
+        last_user_message = next((m['content'] for m in reversed(messages) if m.get('role') == 'user'), None)
+        
+        if not last_user_message:
+            raise HTTPException(status_code=400, detail="请求中未找到用户消息。")
+            
+        return {"Texts": [last_user_message]}
+
+    async def chat_completion(self, request_data: Dict[str, Any]) -> StreamingResponse:
+        model = request_data.get("model", settings.DEFAULT_MODEL)
+        upstream_url = settings.MODEL_MAPPING.get(model)
+
+        if not upstream_url:
+            raise HTTPException(status_code=400, detail=f"不支持的模型: {model}")
+
+        payload = self._prepare_payload(request_data)
+        headers = self._prepare_headers()
+        
+        async def stream_generator() -> AsyncGenerator[bytes, None]:
+            request_id = f"chatcmpl-{uuid.uuid4()}"
+            loop = asyncio.get_running_loop()
+            
+            try:
+                logger.info(f"向 {upstream_url} 发送请求...")
+                response = await loop.run_in_executor(
+                    None, 
+                    lambda: self.scraper.post(
+                        upstream_url,
+                        headers=headers,
+                        json=payload,
+                        timeout=settings.API_REQUEST_TIMEOUT
+                    )
+                )
+                
+                logger.info(f"上游服务返回状态码: {response.status_code}")
+                response.raise_for_status()
+                
+                full_text = response.text
+                logger.info(f"收到完整响应: {full_text[:100]}...")
+
+                # 模式：伪流式生成 (Pseudo-Stream-Generation)
+                for char in full_text:
+                    chunk = create_chat_completion_chunk(request_id, model, char)
+                    yield create_sse_data(chunk)
+                    await asyncio.sleep(0.01) # 控制打字机速度
+
+                final_chunk = create_chat_completion_chunk(request_id, model, "", "stop")
+                yield create_sse_data(final_chunk)
+                yield DONE_CHUNK
+                logger.info("伪流式传输完成。")
+
+            except Exception as e:
+                logger.error(f"处理流时发生错误: {e}", exc_info=True)
+                error_message = f"内部服务器错误: {str(e)}"
+                error_chunk = create_chat_completion_chunk(request_id, model, error_message, "stop")
+                yield create_sse_data(error_chunk)
+                yield DONE_CHUNK
+
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+    async def get_models(self) -> JSONResponse:
+        model_data = {
+            "object": "list",
+            "data": [
+                {"id": name, "object": "model", "created": int(time.time()), "owned_by": "lzA6"}
+                for name in settings.KNOWN_MODELS
+            ]
+        }
+        return JSONResponse(content=model_data)
+
+
+--- 文件路径: app\utils\sse_utils.py ---
+
+# /app/utils/sse_utils.py
+import json
+import time
+from typing import Dict, Any, Optional
+
+DONE_CHUNK = b"data: [DONE]\n\n"
+
+def create_sse_data(data: Dict[str, Any]) -> bytes:
+    return f"data: {json.dumps(data)}\n\n".encode('utf-8')
+
+def create_chat_completion_chunk(
+    request_id: str,
+    model: str,
+    content: str,
+    finish_reason: Optional[str] = None
+) -> Dict[str, Any]:
+    return {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": finish_reason
+            }
+        ]
+    }
+
+
+
